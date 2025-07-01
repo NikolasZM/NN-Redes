@@ -22,6 +22,8 @@ constexpr int NUM_LAYERS_FEDERATED = 3; // 2 ocultas + 1 de salida
 int NUM_EPOCHS = 5;
 int NUM_CLIENTS = 0;
 
+using namespace std;
+
 using Sample = std::vector<float>;
 using Dataset = std::vector<Sample>;
 using Matrix = std::vector<std::vector<float>>;
