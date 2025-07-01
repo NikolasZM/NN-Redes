@@ -35,7 +35,7 @@ class FederatedSplitNN(nn.Module):
 # ================== CONEXIÓN Y DATOS ==================
 try:
     print("Conectando al servidor...")
-    lib.connect("127.0.0.1", 45006)
+    lib.connect("127.0.0.1", 45015)
     
     print("Recibiendo dataset del servidor...")
     X_np, num_epochs = lib.receive_dataset()
@@ -130,4 +130,3 @@ except Exception as e:
 finally:
     print("\nEntrenamiento finalizado o interrumpido.")
     lib.disconnect()
-
