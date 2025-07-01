@@ -3,126 +3,131 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import torch.optim as optim
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
 import numpy as np
-import lib  # pybind11 bridge to C++
+import lib  # Puente a C++ via pybind11
 
-# ================== CONFIG ==================
+# ================== CONFIGURACIÓN ==================
 torch.manual_seed(42)
-input_dim = 11
-num_classes = 3
-hidden1 = 128
-hidden2 = 64
-batch_size = 50
+INPUT_DIM = 11
+NUM_CLASSES = 3
+HIDDEN1 = 128
+HIDDEN2 = 64
+BATCH_SIZE = 32
 
-# ============== Modelo ======================
-class MulticlassClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden1=128, hidden2=64):
+# ================== MODELO NEURONAL ==================
+class FederatedSplitNN(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden1)
-        self.fc2 = nn.Linear(hidden1, hidden2)
-        self.class_logits = nn.Linear(hidden2, num_classes)
-        self.class_log_vars = nn.Linear(hidden2, num_classes)
+        self.fc1 = nn.Linear(INPUT_DIM, HIDDEN1)
+        self.fc2 = nn.Linear(HIDDEN1, HIDDEN2)
+        self.fc3 = nn.Linear(HIDDEN2, NUM_CLASSES)
+
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.xavier_uniform_(self.fc3.weight)
 
     def forward(self, x):
-        x1 = F.relu(self.fc1(x))  # capa 1
-        x2 = F.relu(self.fc2(x1)) # capa 2
-        logits = self.class_logits(x2)
-        log_vars = self.class_log_vars(x2)
-        return logits, log_vars, x1, x2
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-# ============== Conexión con server ================
-lib.connect("127.0.0.1")
-X_np, num_epochs = lib.receive_dataset()
-X = torch.tensor(X_np, dtype=torch.float32)
-y = X[:, -num_classes:]
-X = X[:, :input_dim]
+# ================== CONEXIÓN Y DATOS ==================
+try:
+    print("Conectando al servidor...")
+    lib.connect("127.0.0.1", 45006)
+    
+    print("Recibiendo dataset del servidor...")
+    X_np, num_epochs = lib.receive_dataset()
+    num_epochs = int(num_epochs)
+    print(f"Dataset recibido. Entrenando por {num_epochs} épocas.")
 
-# ============== Dataset ======================
-dataset = TensorDataset(X, y)
-train_size = int(0.8 * len(dataset))
-test_size = len(dataset) - train_size
-train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    X = torch.tensor(X_np, dtype=torch.float32)
+    y = X[:, -NUM_CLASSES:]
+    X = X[:, :INPUT_DIM]
 
-# ============== Inicialización =====================
-model = MulticlassClassifier(input_dim, num_classes)
+    dataset = TensorDataset(X, y)
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+except Exception as e:
+    print(f"Error durante la configuración: {e}")
+    lib.disconnect()
+    exit()
+
+# ================== INICIALIZACIÓN ==================
+model = FederatedSplitNN()
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# ============== Entrenamiento ===============
-train_tracker, test_tracker, accuracy_tracker = [], [], []
-y_true, y_pred = [], []
+# ================== ENTRENAMIENTO FEDERADO ==================
+print("\nIniciando entrenamiento federado...")
+try:
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        for i, (batch_x, batch_y) in enumerate(train_loader):
+            optimizer.zero_grad()
 
-for epoch in range(num_epochs):
-    model.train()
-    epoch_loss = 0
-    for batch_x, batch_y in train_loader:
-        optimizer.zero_grad()
+            # --- Forward Pass ---
+            # CAPA 1
+            z1 = model.fc1(batch_x)
+            print(f"Enviando capa 1 (tamaño: {z1.shape})")
+            lib.send_matrix(z1.detach().numpy())
+            a1_avg_np = lib.receive_average()
+            print(f"Recibido promedio capa 1 (tamaño: {a1_avg_np.shape})")
+            
+            # CAPA 2
+            a1 = torch.tensor(a1_avg_np, dtype=torch.float32)
+            a1_activated = F.relu(a1)
+            z2 = model.fc2(a1_activated)
+            print(f"Enviando capa 2 (tamaño: {z2.shape})")
+            lib.send_matrix(z2.detach().numpy())
+            a2_avg_np = lib.receive_average()
+            print(f"Recibido promedio capa 2 (tamaño: {a2_avg_np.shape})")
 
-        logits, log_vars, x1_out, x2_out = model(batch_x)
+            # CAPA 3
+            a2 = torch.tensor(a2_avg_np, dtype=torch.float32)
+            a2_activated = F.relu(a2)
+            z3 = model.fc3(a2_activated)
+            print(f"Enviando capa 3 (tamaño: {z3.shape})")
+            lib.send_matrix(z3.detach().numpy())
+            final_logits_np = lib.receive_average()
+            print(f"Recibido promedio capa final (tamaño: {final_logits_np.shape})")
 
-        # Capa 1 (entrada -> hidden1)
-        layer1_matrix = x1_out.detach().numpy().tolist()
-        lib.send_matrix(layer1_matrix)
-        x1_avg = torch.tensor(lib.receive_average(), dtype=torch.float32)
 
-        # Capa 2 (hidden1 -> hidden2)
-        layer2_matrix = x2_out.detach().numpy().tolist()
-        lib.send_matrix(layer2_matrix)
-        x2_avg = torch.tensor(lib.receive_average(), dtype=torch.float32)
+            # --- Backward Pass Corregido y Simplificado ---
+            
+            # 1. Reconstruir el grafo desde el último punto promediado (a2)
+            #    para poder calcular la pérdida.
+            final_logits = torch.tensor(final_logits_np, dtype=torch.float32)
+            loss = criterion(final_logits, batch_y)
 
-        # Capa 3 (hidden2 -> output logits)
-        logits_out = logits.detach().numpy().tolist()
-        lib.send_matrix(logits_out)
-        final_avg = lib.receive_average()  # pero no se usa para nada
+            # 2. Reconstruir el grafo completo para la retropropagación
+            #    Esto es necesario porque la conversión a NumPy rompe el grafo de PyTorch.
+            a1_graph = torch.tensor(a1_avg_np, requires_grad=True)
+            a2_graph = F.relu(model.fc2(F.relu(a1_graph)))
+            final_logits_graph = model.fc3(a2_graph)
+            
+            # 3. Calcular gradientes para fc3 y fc2 con respecto a la pérdida
+            surrogate_loss = criterion(final_logits_graph, batch_y)
+            surrogate_loss.backward()
+            
+            # 4. Propagar manualmente el gradiente de a1 hacia atrás a través de fc1
+            z1.backward(a1_graph.grad)
+            
+            # 5. Actualizar todos los pesos
+            optimizer.step()
+            total_loss += loss.item()
 
-        loss = criterion(logits, batch_y)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
 
-    train_tracker.append(epoch_loss / len(train_loader))
-    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {train_tracker[-1]:.4f} | ", end="")
+except Exception as e:
+    print(f"Error durante el entrenamiento: {e}")
+    import traceback
+    traceback.print_exc()
 
-    # Evaluación
-    model.eval()
-    test_loss = 0
-    total = 0
-    correct = 0
-    with torch.no_grad():
-        for batch_x, batch_y in test_loader:
-            logits, log_vars, *_ = model(batch_x)
-            loss = criterion(logits, batch_y)
-            test_loss += loss.item()
+finally:
+    print("\nEntrenamiento finalizado o interrumpido.")
+    lib.disconnect()
 
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == torch.argmax(batch_y, dim=1)).sum().item()
-            total += batch_y.size(0)
-
-            y_true.extend(torch.argmax(batch_y, dim=1))
-            y_pred.extend(preds.tolist())
-
-    acc = correct / total
-    test_tracker.append(test_loss / len(test_loader))
-    accuracy_tracker.append(acc)
-    print(f"Test loss: {test_loss / len(test_loader):.4f} | Accuracy: {acc:.4f}")
-
-# ============== Graficación =================
-plt.plot(train_tracker, label='Training Loss')
-plt.plot(test_tracker, label='Test Loss')
-plt.plot(accuracy_tracker, label='Test Accuracy')
-plt.legend()
-plt.grid(True)
-plt.title("Entrenamiento")
-plt.show()
-
-cm = confusion_matrix(y_true, y_pred)
-ConfusionMatrixDisplay(confusion_matrix=cm).plot(cmap=plt.cm.Blues)
-plt.title("Confusion Matrix")
-plt.show()
-
-print("\nClassification Report:")
-print(classification_report(y_true, y_pred, digits=3))
