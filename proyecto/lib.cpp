@@ -1,171 +1,174 @@
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include <pybind11/numpy.h>
+#include <iostream>
 #include <vector>
 #include <string>
-#include <cstring>
 #include <stdexcept>
-#include <cstdint>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <cstring>
 
 namespace py = pybind11;
+using MatrixF = std::vector<std::vector<float>>;
 
-constexpr int PORT = 9000;
+int client_sock = -1;
 
-int sockfd = -1;
-
-// ============== Conexión TCP ==============
-void connect_to_server(const std::string& server_ip) {
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) throw std::runtime_error("No se pudo crear el socket");
-
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
-
-    if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0)
-        throw std::runtime_error("IP inválida");
-
-    if (connect(sockfd, (sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
-        throw std::runtime_error("Conexión fallida con el servidor");
-}
-
-// ============== Recepción de datos tipo 'e' ==============
-std::pair<std::vector<std::vector<float>>, int> receive_dataset() {
-    std::vector<std::vector<float>> columns;
-    int epochs = 0;
-
-    while (true) {
-        char header[16];
-        int total_read = read(sockfd, header, 16);
-        if (total_read <= 0) throw std::runtime_error("Error al leer cabecera");
-
-        uint64_t size_total;
-        memcpy(&size_total, &header[0], 5);
-
-        char type = header[5];
-        if (type != 'e') throw std::runtime_error("Tipo incorrecto, se esperaba 'e'");
-
-        memcpy(&epochs, &header[6], 4);
-        bool is_last = header[10];
-
-        uint64_t total_numbers;
-        memcpy(&total_numbers, &header[11], 5);
-
-        int payload_size = size_total - 16;
-        std::vector<char> payload(payload_size);
-        int read_bytes = read(sockfd, payload.data(), payload_size);
-        if (read_bytes <= 0) throw std::runtime_error("Error al leer datos");
-
-        std::vector<float> column;
-        size_t offset = 0;
-        for (uint64_t i = 0; i < total_numbers; ++i) {
-            uint16_t sz;
-            memcpy(&sz, &payload[offset], 2);
-            float val;
-            memcpy(&val, &payload[offset + 2], 4);
-            column.push_back(val);
-            offset += 6;
-        }
-
-        columns.push_back(column);
-        if (is_last) break;
+// ================== FUNCIONES DE COMUNICACIÓN (CLIENTE) ==================
+void safe_write(int sock, const char* buffer, size_t count) {
+    ssize_t sent = 0;
+    while (sent < count) {
+        ssize_t res = write(sock, buffer + sent, count - sent);
+        if (res <= 0) throw std::runtime_error("Fallo al escribir en socket");
+        sent += res;
     }
-
-    // Reorganizar columnas en filas
-    size_t num_rows = columns[0].size();
-    size_t num_cols = columns.size();
-    std::vector<std::vector<float>> matrix(num_rows, std::vector<float>(num_cols));
-
-    for (size_t c = 0; c < num_cols; ++c)
-        for (size_t r = 0; r < num_rows; ++r)
-            matrix[r][c] = columns[c][r];
-
-    return {matrix, epochs};
 }
 
-// ============== Enviar activaciones con protocolo 'M' ==============
-void send_matrix(const std::vector<std::vector<float>>& matrix) {
-    size_t num_cols = matrix[0].size();
+void safe_read(int sock, char* buffer, size_t count) {
+    ssize_t received = 0;
+    while (received < count) {
+        ssize_t res = read(sock, buffer + received, count - received);
+        if (res <= 0) throw std::runtime_error("Fallo al leer de socket");
+        received += res;
+    }
+}
+
+void send_matrix_by_columns_client(char protocol_type, const MatrixF& matrix) {
+    if (client_sock < 0) throw std::runtime_error("No conectado al servidor");
+    if (matrix.empty() || matrix[0].empty()) return;
+
     size_t num_rows = matrix.size();
+    size_t num_cols = matrix[0].size();
 
-    for (size_t col = 0; col < num_cols; ++col) {
+    for (size_t j = 0; j < num_cols; ++j) {
         std::vector<char> buffer;
-        uint64_t size_total = 1 + 1 + 5 + num_rows * (2 + 4);
-        buffer.resize(5 + size_total);
+        bool is_last = (j == num_cols - 1);
+        
+        buffer.push_back(protocol_type);
+        buffer.push_back(is_last ? 1 : 0);
+        uint32_t num_floats = num_rows;
+        buffer.insert(buffer.end(), (char*)&num_floats, (char*)&num_floats + sizeof(uint32_t));
 
-        memcpy(&buffer[0], &size_total, 5);
-        buffer[5] = 'M';
-        buffer[6] = (col == num_cols - 1 ? 1 : 0);
-        uint64_t total_numbers = num_rows;
-        memcpy(&buffer[7], &total_numbers, 5);
-
-        size_t offset = 12;
         for (size_t i = 0; i < num_rows; ++i) {
-            uint16_t sz = 4;
-            memcpy(&buffer[offset], &sz, 2);
-            memcpy(&buffer[offset + 2], &matrix[i][col], 4);
-            offset += 6;
+            float val = matrix[i][j];
+            buffer.insert(buffer.end(), (char*)&val, (char*)&val + sizeof(float));
         }
 
-        write(sockfd, buffer.data(), buffer.size());
+        uint32_t total_size = buffer.size();
+        safe_write(client_sock, (char*)&total_size, sizeof(uint32_t));
+        safe_write(client_sock, buffer.data(), buffer.size());
     }
 }
 
-// ============== Recibir promedio 'm' ==============
-std::vector<std::vector<float>> receive_average_matrix() {
-    std::vector<std::vector<float>> columns;
+py::object receive_matrix_by_columns_client(char expected_type, bool with_epochs = false) {
+    if (client_sock < 0) throw std::runtime_error("No conectado al servidor");
 
-    while (true) {
-        char header[12];
-        int total_read = read(sockfd, header, 12);
-        if (total_read <= 0) throw std::runtime_error("Error al leer header de promedio");
+    MatrixF received_matrix;
+    bool all_columns_received = false;
+    uint32_t num_epochs = 0;
 
-        uint64_t size_total;
-        memcpy(&size_total, &header[0], 5);
-        char type = header[5];
-        if (type != 'm') throw std::runtime_error("Esperado 'm'");
+    while (!all_columns_received) {
+        uint32_t total_size;
+        safe_read(client_sock, (char*)&total_size, sizeof(uint32_t));
+        
+        std::vector<char> buffer(total_size);
+        safe_read(client_sock, buffer.data(), total_size);
 
-        bool is_last = header[6];
-        uint64_t total_numbers;
-        memcpy(&total_numbers, &header[7], 5);
-
-        int payload_size = size_total - 12;
-        std::vector<char> payload(payload_size);
-        read(sockfd, payload.data(), payload_size);
-
-        std::vector<float> column;
         size_t offset = 0;
-        for (uint64_t i = 0; i < total_numbers; ++i) {
-            uint16_t sz;
-            memcpy(&sz, &payload[offset], 2);
-            float val;
-            memcpy(&val, &payload[offset + 2], 4);
-            column.push_back(val);
-            offset += 6;
+        char protocol_type = buffer[offset++];
+        if (protocol_type != expected_type) throw std::runtime_error("Tipo de protocolo inesperado");
+
+        if (with_epochs) {
+            memcpy(&num_epochs, &buffer[offset], sizeof(uint32_t));
+            offset += sizeof(uint32_t);
         }
 
-        columns.push_back(column);
-        if (is_last) break;
+        all_columns_received = buffer[offset++];
+        
+        uint32_t num_floats;
+        memcpy(&num_floats, &buffer[offset], sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+
+        if (received_matrix.empty()) {
+            received_matrix.resize(num_floats);
+        }
+
+        for (size_t i = 0; i < num_floats; ++i) {
+            float val;
+            memcpy(&val, &buffer[offset], sizeof(float));
+            offset += sizeof(float);
+            received_matrix[i].push_back(val);
+        }
+    }
+    
+    py::array_t<float> result_np({received_matrix.size(), received_matrix.empty() ? 0 : received_matrix[0].size()});
+    auto buf = result_np.request();
+    float *ptr = static_cast<float *>(buf.ptr);
+    for(size_t i=0; i<received_matrix.size(); ++i) {
+        for(size_t j=0; j<received_matrix[0].size(); ++j) {
+            ptr[i * received_matrix[0].size() + j] = received_matrix[i][j];
+        }
     }
 
-    size_t num_rows = columns[0].size();
-    size_t num_cols = columns.size();
-    std::vector<std::vector<float>> matrix(num_rows, std::vector<float>(num_cols));
-
-    for (size_t c = 0; c < num_cols; ++c)
-        for (size_t r = 0; r < num_rows; ++r)
-            matrix[r][c] = columns[c][r];
-
-    return matrix;
+    if (with_epochs) {
+        return py::make_tuple(result_np, num_epochs);
+    }
+    return result_np;
 }
 
-// ============== Export pybind11 ==============
+// ================== FUNCIONES EXPUESTAS A PYTHON ==================
+void connect_to_server(const std::string& ip, int port) {
+    client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_sock < 0) throw std::runtime_error("No se pudo crear el socket");
 
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr) <= 0) {
+        throw std::runtime_error("Dirección IP inválida");
+    }
+
+    if (connect(client_sock, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        throw std::runtime_error("Conexión fallida con el servidor");
+    }
+    std::cout << "Conectado al servidor " << ip << ":" << port << std::endl;
+}
+
+void disconnect_from_server() {
+    if (client_sock >= 0) {
+        close(client_sock);
+        client_sock = -1;
+    }
+}
+
+// ================== DEFINICIÓN DEL MÓDULO PYBIND11 ==================
 PYBIND11_MODULE(lib, m) {
-    m.def("connect", &connect_to_server, "Conectar con el servidor");
-    m.def("receive_dataset", &receive_dataset, "Recibir dataset inicial");
-    m.def("send_matrix", &send_matrix, "Enviar matriz de activaciones");
-    m.def("receive_average", &receive_average_matrix, "Recibir matriz promedio");
+    m.doc() = "Librería C++ para comunicación de red";
+
+    m.def("connect", &connect_to_server, "Conecta al servidor", py::arg("ip"), py::arg("port") = 9000);
+    m.def("disconnect", &disconnect_from_server, "Desconecta del servidor");
+
+    m.def("receive_dataset", []() {
+        return receive_matrix_by_columns_client('e', true);
+    }, "Recibe el dataset inicial y las épocas del servidor");
+
+    m.def("send_matrix", [](py::array_t<float, py::array::c_style | py::array::forcecast> arr) {
+        py::buffer_info buf = arr.request();
+        if (buf.ndim != 2) throw std::runtime_error("La matriz debe tener 2 dimensiones");
+
+        MatrixF matrix(buf.shape[0], std::vector<float>(buf.shape[1]));
+        float* ptr = static_cast<float*>(buf.ptr);
+        for(ssize_t i=0; i<buf.shape[0]; ++i) {
+            for(ssize_t j=0; j<buf.shape[1]; ++j) {
+                matrix[i][j] = ptr[i * buf.shape[1] + j];
+            }
+        }
+        send_matrix_by_columns_client('M', matrix);
+    }, "Envía una matriz al servidor");
+
+    m.def("receive_average", []() {
+        return receive_matrix_by_columns_client('m', false);
+    }, "Recibe la matriz promediada del servidor");
 }
+
