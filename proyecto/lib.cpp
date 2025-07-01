@@ -9,11 +9,43 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
+#include <iomanip>
 
 namespace py = pybind11;
 using MatrixF = std::vector<std::vector<float>>;
 
 int client_sock = -1;
+
+std::string encode_float_string(float val) {
+    std::ostringstream oss;
+    oss << val;
+    std::string s = oss.str();
+    uint16_t len = s.size();
+    std::ostringstream result;
+    result << std::setw(2) << std::setfill('0') << len << s;
+    return result.str();
+}
+
+float decode_float_string(const std::vector<char>& buffer, size_t& offset) {
+    if (offset + 2 > buffer.size()) throw std::runtime_error("decode_float_string: fuera de rango al leer tamaño");
+
+    std::string len_str(buffer.begin() + offset, buffer.begin() + offset + 2);
+    offset += 2;
+
+    int len = std::stoi(len_str);
+    if (offset + len > buffer.size()) throw std::runtime_error("decode_float_string: fuera de rango al leer string float");
+
+    std::string float_str(buffer.begin() + offset, buffer.begin() + offset + len);
+    offset += len;
+
+    try {
+        return std::stof(float_str);
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] No se pudo convertir a float: [" << float_str << "] (len: " << len << ")\n";
+        throw;
+    }
+}
+
 
 // ================== FUNCIONES DE COMUNICACIÓN (CLIENTE) ==================
 void safe_write(int sock, const char* buffer, size_t count) {
@@ -42,24 +74,37 @@ void send_matrix_by_columns_client(char protocol_type, const MatrixF& matrix) {
     size_t num_cols = matrix[0].size();
 
     for (size_t j = 0; j < num_cols; ++j) {
-        std::vector<char> buffer;
-        bool is_last = (j == num_cols - 1);
-        
-        buffer.push_back(protocol_type);
-        buffer.push_back(is_last ? 1 : 0);
-        uint32_t num_floats = num_rows;
-        buffer.insert(buffer.end(), (char*)&num_floats, (char*)&num_floats + sizeof(uint32_t));
+        std::ostringstream payload;
 
-        for (size_t i = 0; i < num_rows; ++i) {
-            float val = matrix[i][j];
-            buffer.insert(buffer.end(), (char*)&val, (char*)&val + sizeof(float));
+        // [letra protocolo]
+        payload << protocol_type;
+
+        // [número de épocas] solo si es 'e' (este lado no lo usa, pero lo dejamos por claridad)
+        if (protocol_type == 'e') {
+            payload << std::setw(4) << std::setfill('0') << 5;  // si quieres parametrizar, cámbialo
         }
 
-        uint32_t total_size = buffer.size();
-        safe_write(client_sock, (char*)&total_size, sizeof(uint32_t));
-        safe_write(client_sock, buffer.data(), buffer.size());
+        // [última columna]
+        payload << (j == num_cols - 1 ? '1' : '0');
+
+        // [cantidad de datos]
+        payload << std::setw(5) << std::setfill('0') << num_rows;
+
+        // [tamaño dato + dato] por cada elemento
+        for (size_t i = 0; i < num_rows; ++i) {
+            payload << encode_float_string(matrix[i][j]);
+        }
+
+        // [tamaño total como string de 5 bytes] + payload
+        std::string body = payload.str();
+        std::ostringstream full_msg;
+        full_msg << std::setw(5) << std::setfill('0') << body.size() << body;
+
+        std::string final_str = full_msg.str();
+        safe_write(client_sock, final_str.c_str(), final_str.size());
     }
 }
+
 
 py::object receive_matrix_by_columns_client(char expected_type, bool with_epochs = false) {
     if (client_sock < 0) throw std::runtime_error("No conectado al servidor");
@@ -69,39 +114,47 @@ py::object receive_matrix_by_columns_client(char expected_type, bool with_epochs
     uint32_t num_epochs = 0;
 
     while (!all_columns_received) {
-        uint32_t total_size;
-        safe_read(client_sock, (char*)&total_size, sizeof(uint32_t));
-        
+        // Leer los primeros 5 bytes que indican el tamaño total
+        char size_buf[5];
+        safe_read(client_sock, size_buf, 5);
+        int total_size = std::stoi(std::string(size_buf, 5));
+
+        // Leer el resto del mensaje
         std::vector<char> buffer(total_size);
         safe_read(client_sock, buffer.data(), total_size);
 
         size_t offset = 0;
+
+        // Tipo de protocolo
         char protocol_type = buffer[offset++];
         if (protocol_type != expected_type) throw std::runtime_error("Tipo de protocolo inesperado");
 
+        // Épocas (si corresponde)
         if (with_epochs) {
-            memcpy(&num_epochs, &buffer[offset], sizeof(uint32_t));
-            offset += sizeof(uint32_t);
+            std::string ep_str(buffer.begin() + offset, buffer.begin() + offset + 4);
+            num_epochs = std::stoi(ep_str);
+            offset += 4;
         }
 
-        all_columns_received = buffer[offset++];
-        
-        uint32_t num_floats;
-        memcpy(&num_floats, &buffer[offset], sizeof(uint32_t));
-        offset += sizeof(uint32_t);
+        // Última columna
+        char is_last_col = buffer[offset++];
+        all_columns_received = (is_last_col == '1');
 
-        if (received_matrix.empty()) {
-            received_matrix.resize(num_floats);
-        }
+        // Número total de datos
+        std::string total_vals_str(buffer.begin() + offset, buffer.begin() + offset + 5);
+        int num_vals = std::stoi(total_vals_str);
+        offset += 5;
 
-        for (size_t i = 0; i < num_floats; ++i) {
-            float val;
-            memcpy(&val, &buffer[offset], sizeof(float));
-            offset += sizeof(float);
+        // Decodificar los datos
+        if (received_matrix.empty()) received_matrix.resize(num_vals);
+
+        for (int i = 0; i < num_vals; ++i) {
+            float val = decode_float_string(buffer, offset);
             received_matrix[i].push_back(val);
         }
     }
-    
+
+    // Convertir a numpy
     py::array_t<float> result_np({received_matrix.size(), received_matrix.empty() ? 0 : received_matrix[0].size()});
     auto buf = result_np.request();
     float *ptr = static_cast<float *>(buf.ptr);
@@ -171,4 +224,3 @@ PYBIND11_MODULE(lib, m) {
         return receive_matrix_by_columns_client('m', false);
     }, "Recibe la matriz promediada del servidor");
 }
-
