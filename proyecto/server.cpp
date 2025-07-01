@@ -14,7 +14,7 @@
 #include <condition_variable>
 
 // ================== CONFIGURACIÓN ==================
-constexpr int PORT = 45006;
+constexpr int PORT = 45015;
 constexpr int INPUT_DIM = 11;
 constexpr int CLASS_DIM = 3;
 constexpr int TOTAL_DIM = INPUT_DIM + CLASS_DIM;
@@ -35,6 +35,27 @@ bool average_is_ready = false;
 
 std::vector<int> all_client_sockets;
 std::map<int, Matrix> client_matrices;
+
+std::string encode_float_string(float val) {
+    std::ostringstream oss;
+    oss << val;
+    std::string s = oss.str();
+    std::ostringstream result;
+    result << std::setw(2) << std::setfill('0') << s.size() << s;
+    return result.str();
+}
+
+
+float decode_float_string(const std::vector<char>& buffer, size_t& offset) {
+    std::string len_str(buffer.begin() + offset, buffer.begin() + offset + 2);
+    offset += 2;
+    int len = std::stoi(len_str);
+    std::string float_str(buffer.begin() + offset, buffer.begin() + offset + len);
+    offset += len;
+    return std::stof(float_str);
+}
+
+
 
 // ================== LECTURA CSV Y BALANCEO ==================
 Dataset read_csv(const std::string& filename) {
@@ -89,6 +110,7 @@ void safe_write(int sock, const char* buffer, size_t count) {
         if (res <= 0) throw std::runtime_error("Fallo al escribir en socket");
         sent += res;
     }
+    cout << "[ENVIANDO] " << buffer << endl;
 }
 
 void safe_read(int sock, char* buffer, size_t count) {
@@ -98,6 +120,7 @@ void safe_read(int sock, char* buffer, size_t count) {
         if (res <= 0) throw std::runtime_error("Fallo al leer de socket");
         received += res;
     }
+    cout << "[LEYENDO] " << buffer << endl;
 }
 
 void send_matrix_by_columns(int sock, char protocol_type, const Matrix& matrix) {
@@ -107,63 +130,79 @@ void send_matrix_by_columns(int sock, char protocol_type, const Matrix& matrix) 
     size_t num_cols = matrix[0].size();
 
     for (size_t j = 0; j < num_cols; ++j) {
-        std::vector<char> buffer;
-        bool is_last = (j == num_cols - 1);
-        
-        buffer.push_back(protocol_type);
+        std::ostringstream payload;
+
+        // [tipo protocolo]
+        payload << protocol_type;
+
+        // [número de épocas] si es 'e'
         if (protocol_type == 'e') {
-            uint32_t epochs = NUM_EPOCHS;
-            buffer.insert(buffer.end(), (char*)&epochs, (char*)&epochs + sizeof(uint32_t));
+            payload << std::setw(4) << std::setfill('0') << NUM_EPOCHS;
         }
-        buffer.push_back(is_last ? 1 : 0);
-        uint32_t num_floats = num_rows;
-        buffer.insert(buffer.end(), (char*)&num_floats, (char*)&num_floats + sizeof(uint32_t));
 
+        // [es última columna]
+        payload << (j == num_cols - 1 ? '1' : '0');
+
+        // [cantidad de datos]
+        payload << std::setw(5) << std::setfill('0') << num_rows;
+
+        // [datos codificados]
         for (size_t i = 0; i < num_rows; ++i) {
-            float val = matrix[i][j];
-            buffer.insert(buffer.end(), (char*)&val, (char*)&val + sizeof(float));
+            payload << encode_float_string(matrix[i][j]);
         }
 
-        uint32_t total_size = buffer.size();
-        safe_write(sock, (char*)&total_size, sizeof(uint32_t));
-        safe_write(sock, buffer.data(), buffer.size());
+        std::string msg = payload.str();
+        std::ostringstream final_msg;
+        final_msg << std::setw(5) << std::setfill('0') << msg.size() << msg;
+
+        std::string full = final_msg.str();
+        safe_write(sock, full.c_str(), full.size());
     }
 }
 
-Matrix receive_matrix_by_columns(int sock, char expected_type) {
-    Matrix received_matrix;
-    bool all_columns_received = false;
 
-    while (!all_columns_received) {
-        uint32_t total_size;
-        safe_read(sock, (char*)&total_size, sizeof(uint32_t));
-        
+
+Matrix receive_matrix_by_columns(int sock, char expected_type, bool with_epochs = false) {
+    Matrix matrix;
+    bool finished = false;
+
+    while (!finished) {
+        char size_buf[5];
+        safe_read(sock, size_buf, 5);
+        int total_size = std::stoi(std::string(size_buf, 5));
+
         std::vector<char> buffer(total_size);
         safe_read(sock, buffer.data(), total_size);
 
         size_t offset = 0;
-        char protocol_type = buffer[offset++];
-        if (protocol_type != expected_type) throw std::runtime_error("Tipo de protocolo inesperado");
+        char type = buffer[offset++];
+        if (type != expected_type) throw std::runtime_error("Tipo de protocolo inválido");
 
-        all_columns_received = buffer[offset++];
-        
-        uint32_t num_floats;
-        memcpy(&num_floats, &buffer[offset], sizeof(uint32_t));
-        offset += sizeof(uint32_t);
-
-        if (received_matrix.empty()) {
-            received_matrix.resize(num_floats);
+        int num_epochs = 0;
+        if (expected_type == 'e' && with_epochs) {
+            std::string ep_str(buffer.begin() + offset, buffer.begin() + offset + 4);
+            num_epochs = std::stoi(ep_str);
+            offset += 4;
         }
 
-        for (size_t i = 0; i < num_floats; ++i) {
-            float val;
-            memcpy(&val, &buffer[offset], sizeof(float));
-            offset += sizeof(float);
-            received_matrix[i].push_back(val);
+        char is_last_col = buffer[offset++];
+        finished = (is_last_col == '1');
+
+        std::string total_str(buffer.begin() + offset, buffer.begin() + offset + 5);
+        int num_vals = std::stoi(total_str);
+        offset += 5;
+
+        if (matrix.empty()) matrix.resize(num_vals);
+
+        for (int i = 0; i < num_vals; ++i) {
+            float val = decode_float_string(buffer, offset);
+            matrix[i].push_back(val);
         }
     }
-    return received_matrix;
+
+    return matrix;
 }
+
 
 // ================== LÓGICA DE MANEJO DE CLIENTE ==================
 void handle_client(int client_id, int client_sock, const Dataset& data) {
@@ -293,4 +332,3 @@ int main() {
     close(server_fd);
     return 0;
 }
-
